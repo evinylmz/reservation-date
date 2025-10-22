@@ -1,1 +1,5 @@
-/apikey.py
+# Gizli dosyalar
+.env
+__pycache__/
+*.pyc
+

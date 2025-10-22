@@ -2,12 +2,15 @@ import os
 from openai import OpenAI
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # --- TOKENLAR ---
 # ⚠️ Güvenlik uyarısı: Gerçek projede bu değerleri doğrudan yazma!
 # Test için buraya geçici olarak ekledik.
-TELEGRAM_TOKEN = "8362034436:AAF8_nuPVDKKs9XXC9WFe5zHcf88qLO9U1c"
-OPENROUTER_API_KEY = "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"
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
 if not TELEGRAM_TOKEN:
     raise ValueError("Lütfen TELEGRAM_TOKEN ortam değişkenini ayarlayın.")
