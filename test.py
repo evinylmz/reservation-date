@@ -6,6 +6,8 @@ from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.constants import ChatAction
+import random # Rezervasyon ID'si için
+import uuid # Geçici kullanıcı ID'si için (Eğer auth olmasaydı)
 
 # Kütüphaneler
 from google import genai
@@ -16,7 +18,7 @@ from google.genai.errors import APIError as GeminiAPIError
 
 # Token ve Anahtarlarınız (Değerleriniz Koda Yerleştirilmiştir)
 TELEGRAM_BOT_TOKEN = "your token"
-LLM_API_KEY = "your key" 
+LLM_API_KEY = "your api key" 
 RESTORAN_ADI = "Hafta3 Restoranı"
 
 # Loglama ayarı
@@ -28,6 +30,11 @@ logger = logging.getLogger(__name__)
 # Her kullanıcı için konuşma geçmişini (hafızayı) tutacak yapı
 user_conversations = {}
 
+# 💾 REZERVASYON VERİ TABANI SİMÜLASYONU (Hafıza)
+# Gerçek uygulamada burası Firestore, PostgreSQL vb. bir veritabanı olmalıdır.
+# { 'RZ1234': {'date': '2025-01-01', 'time': '19:00', 'party_size': 4, 'customer_name': 'Ahmet Yılmaz', 'telegram_user_id': 123456}, ... }
+RESERVATIONS_DB = {}
+
 # ⚠️ GEMINI İSTEMCİSİ: Anahtar ile başlatılıyor
 try:
     gemini_client = genai.Client(api_key=LLM_API_KEY)
@@ -37,49 +44,66 @@ except Exception as e:
 
 GEMINI_MODEL = "gemini-2.5-flash" 
 
-# --- I. LLM SİSTEM PROMPT'U ---
+# --- I. LLM SİSTEM PROMPT'U (GÜNCELLENDİ) ---
 
 def get_system_prompt():
     """LLM'in rolünü, kurallarını ve formatını belirleyen prompt'u döndürür."""
     today_date = datetime.now().strftime('%Y-%m-%d')
     
     prompt = f"""
-    Sen, "{RESTORAN_ADI}" için bir rezervasyon asistanısın.
-    Görevin, kullanıcıdan rezervasyon için 3 temel bilgiyi toplamaktır: TARİH, SAAT ve KİŞİ SAYISI.
-    Kullanıcıyla doğal bir dille sohbet et.
+    Sen, "{RESTORAN_ADI}" için akıllı bir asistan ve rezervasyon yöneticisisin.
+    Görevin, iki temel işlemi yönetmek: YENİ REZERVASYON ALMAK veya VAR OLAN REZERVASYONU SORGULAMAK.
+
+    YENİ REZERVASYON İÇİN 4 temel bilgiyi toplamalısın: TARİH, SAAT, KİŞİ SAYISI ve MÜŞTERİ ADI/SOYADI.
+    VAR OLAN REZERVASYONU SORGULAMAK İÇİN ise 2 bilgi toplamalısın: REZERVASYON NUMARASI (RZ ile başlar) ve MÜŞTERİ ADI/SOYADI.
 
     KURALLAR:
-    1. Tüm bu 3 bilgi (tarih, saat, kişi sayısı) netleştiğinde, başka HİÇBİR ŞEY YAZMADAN, sadece ve sadece şu formatta bir JSON objesi döndür:
-       {{"intent": "check_availability", "date": "YYYY-MM-DD", "time": "HH:MM", "party_size": N}}
-    2. Eğer bilgiler eksikse (örn: "yarın 3 kişi" dedi ama saat vermedi), JSON DÖNDÜRME. Eksik olan bilgiyi kibarca iste (örn: "Harika, yarın 3 kişi için. Saat kaçta gelmeyi düşünüyorsunuz?").
-    3. Tarihleri her zaman YYYY-MM-DD formatına, saatleri HH:MM (24 saat formatı) formatına çevir. Bugünün tarihi: {today_date}
-    4. Kullanıcı sohbet ederse ("merhaba", "nasılsın"), kibarca cevap ver ve rezervasyon için yardımcı olabileceğini belirt.
+    1. YENİ REZERVASYON: Tüm 4 bilgi (tarih, saat, kişi sayısı, ad/soyad) netleştiğinde, HİÇBİR ŞEY YAZMADAN, sadece bu formatta bir JSON döndür:
+       {{"intent": "check_availability", "date": "YYYY-MM-DD", "time": "HH:MM", "party_size": N, "customer_name": "Ad Soyad"}}
+    2. REZERVASYON SORGULAMA: Kullanıcı "rezervasyonumu öğrenmek istiyorum", "ne zaman rezervasyonum var" gibi bir talepte bulunursa, Rezervasyon No'yu ve Ad/Soyad bilgisini iste. İki bilgi de netleştiğinde, HİÇBİR ŞEY YAZMADAN, sadece bu formatta bir JSON döndür:
+       {{"intent": "retrieve_reservation", "reservation_id": "RZxxxx", "customer_name": "Ad Soyad"}}
+    3. Bilgiler eksikse, JSON DÖNDÜRME. Eksik olan bilgiyi kibarca iste.
+    4. Tarihleri her zaman YYYY-MM-DD formatına, saatleri HH:MM (24 saat formatı) formatına çevir. Bugünün tarihi: {today_date}
+    5. Müşteri Adı/Soyadı her zaman *İlk Harfleri Büyük* olacak şekilde temizlenmiş olarak verilmelidir.
+    6. Kullanıcı sohbet ederse, kibarca cevap ver ve rezervasyon için yardımcı olabileceğini belirt.
     """
     return prompt.strip()
 
 
-# --- II. REZERVASYON İŞLEMLERİ (ÖNEMLİ: Gerçek API bağlantısı buraya gelmeli) ---
+# --- II. REZERVASYON İŞLEMLERİ (YENİ VE GÜNCELLENMİŞ) ---
 
-async def process_reservation_check(details: dict, update: Update):
-    """
-    LLM'den gelen JSON'u işler, müsaitlik kontrolünü yapar ve sonucu LLM'e geri gönderir.
-    Bu kısım sadece simülasyondur.
-    """
-    try:
-        date = details.get("date")
-        time = details.get("time")
-        party_size = details.get("party_size")
-        
-        # ⚠️ SİMÜLASYON BAŞLANGICI ⚠️
-        if party_size > 6:
-            response_to_llm = f"Rezervasyon yapılamadı: {party_size} kişi için müsait masa bulunamadı. Lütfen daha küçük bir grup veya başka bir tarih deneyin."
-        else:
-            reservation_id = "RZ" + str(hash(date + time + str(party_size)) % 10000)
-            masa_adı = "Masa 5 (Pencere Kenarı)" 
-            customer_name = update.effective_user.first_name or "Misafir"
-            final_message = f"""
+async def handle_check_availability(details: dict, update: Update):
+    """LLM'den gelen yeni rezervasyon JSON'unu işler ve kaydeder."""
+    date = details.get("date")
+    time = details.get("time")
+    party_size = details.get("party_size")
+    customer_name = details.get("customer_name")
+    user_id = update.effective_user.id
+    
+    # Kişi sayısı kontrolü (Simülasyon)
+    if party_size > 6:
+        return f"{customer_name} için {party_size} kişilik yerimiz maalesef şu an müsait değil. Daha küçük bir grup veya başka bir tarih deneyebilir misiniz?"
+    
+    # 💾 Rezervasyonu Kaydet
+    # Rezervasyon ID'si oluşturma
+    reservation_id = "RZ" + str(random.randint(1000, 9999)) 
+    masa_adı = "Masa 5 (Pencere Kenarı)" 
+    
+    reservation_data = {
+        "date": date,
+        "time": time,
+        "party_size": party_size,
+        "customer_name": customer_name,
+        "masa_adı": masa_adı,
+        "telegram_user_id": user_id 
+    }
+    
+    RESERVATIONS_DB[reservation_id] = reservation_data
+    logger.info(f"Yeni Rezervasyon Kaydedildi: {reservation_id} - {customer_name}")
+
+    final_message = f"""
 Harika, **{customer_name}**!
-Rezervasyonunuz (No: **{reservation_id}**) başarıyla oluşturuldu.
+Rezervasyonunuz (No: **{reservation_id}**) başarıyla oluşturuldu ve sistemimize kaydedildi.
 
 Detaylar:
 📅 Tarih: {date}
@@ -88,20 +112,50 @@ Detaylar:
 📍 Masa: {masa_adı}
 
 Sizi ağırlamak için sabırsızlanıyoruz!
-            """
+    """
+    
+    await update.message.reply_html(final_message)
+    # Başarılı kayıt sonrası hafızayı temizle
+    if user_id in user_conversations:
+        del user_conversations[user_id]
+    
+    return None # Başarılıysa LLM'e geri bildirim gönderme
+
+async def handle_retrieve_reservation(details: dict, update: Update):
+    """LLM'den gelen sorgulama JSON'unu işler ve rezervasyonu bulur."""
+    reservation_id = details.get("reservation_id", "").upper().strip()
+    customer_name = details.get("customer_name", "").strip()
+    
+    # Veritabanında kontrol et
+    reservation = RESERVATIONS_DB.get(reservation_id)
+    
+    if reservation:
+        # Rezervasyon bulundu, isim eşleşmesini kontrol et
+        if reservation["customer_name"].lower() == customer_name.lower():
             
+            final_message = f"""
+**{reservation['customer_name']}** Bey/Hanım, işte **{reservation_id}** numaralı rezervasyonunuzun detayları:
+
+Detaylar:
+📅 Tarih: {reservation['date']}
+⏰ Saat: {reservation['time']}
+👥 Kişi Sayısı: {reservation['party_size']}
+📍 Masa: {reservation['masa_adı']}
+
+Sizi bekliyoruz!
+            """
             await update.message.reply_html(final_message)
             user_id = update.effective_user.id
             if user_id in user_conversations:
                 del user_conversations[user_id]
-            
-            return # Rezervasyon başarılı, LLM'i tekrar çağırmıyoruz
+            return None # Başarılıysa LLM'e geri bildirim gönderme
 
-        return response_to_llm # Başarısızlık durumunda LLM'e geri bildirim
-        
-    except Exception as e:
-        logger.error(f"Rezervasyon kontrol hatası: {e}")
-        return "Üzgünüm, rezervasyon sistemimizde bir hata oluştu. Lütfen tekrar deneyin."
+        else:
+            # İsim rezervasyon no ile eşleşmedi
+            return f"Üzgünüm, {reservation_id} numaralı rezervasyon, verdiğiniz isim ({customer_name}) ile eşleşmiyor. Lütfen isminizi veya rezervasyon numaranızı tekrar kontrol edin."
+    else:
+        # Rezervasyon No bulunamadı
+        return f"Üzgünüm, **{reservation_id}** numaralı bir rezervasyon kaydı bulamadık. Lütfen numaranızı kontrol edin."
 
 
 # --- III. TELEGRAM İŞLEYİCİ FONKSİYONLARI ---
@@ -112,13 +166,19 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id in user_conversations:
         del user_conversations[user_id]
     
-    await update.message.reply_text(
+    # Güncel rezervasyon sayısı
+    rez_sayisi = len(RESERVATIONS_DB)
+    
+    await update.message.reply_html(
         f'Hoş geldiniz! Ben **{RESTORAN_ADI}** için rezervasyon asistanınız. '
-        f'Size yardımcı olmaktan mutluluk duyarım. Rezervasyon yapmak istediğiniz tarih, saat ve kişi sayısını belirtir misiniz?'
+        f'Size yardımcı olmaktan mutluluk duyarım. '
+        f'Sistemimizde şu anda **{rez_sayisi}** kayıtlı rezervasyon bulunmaktadır.'
+        f'\n\n**Yeni bir rezervasyon yapmak** için tarih, saat, kişi sayısı ve ad/soyadınızı belirtin.'
+        f'\n**Mevcut rezervasyonunuzu sorgulamak** için ise "Rezervasyonumu sorgula" veya "rezervasyonum ne zaman?" gibi bir soru sorabilirsiniz.'
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Kullanıcının her mesajını işler."""
+    """Kullanıcının her mesajını işler ve intent'e göre yönlendirir."""
     if not gemini_client:
         await update.message.reply_text("Üzgünüm, Gemini API istemcisi doğru şekilde başlatılamadı.")
         return
@@ -128,7 +188,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Konuşma geçmişini al veya oluştur
     if user_id not in user_conversations:
-        # 🟢 DÜZELTME UYGULANDI: Sistem prompt'u doğru Gemini formatıyla ilk mesaj olarak ekleniyor.
         initial_system_prompt_content = genai_types.Content(
             role="user", 
             parts=[genai_types.Part(text=get_system_prompt())]
@@ -140,7 +199,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await context.bot.send_chat_action(chat_id=user_id, action=ChatAction.TYPING)
     
-    # 2. LLM Çağrısı (Gemini'ye özgü)
+    # 2. LLM Çağrısı
     try:
         response = gemini_client.models.generate_content(
             model=GEMINI_MODEL,
@@ -153,62 +212,70 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     except GeminiAPIError as e:
         logger.error(f"Gemini API Çağrısı Hatası: {e}")
-        await update.message.reply_text("Üzgünüm, Gemini API'ye ulaşılamıyor (Belki günlük limit aşıldı). Lütfen tekrar deneyin.")
+        await update.message.reply_text("Üzgünüm, Gemini API'ye ulaşılamıyor. Lütfen tekrar deneyin.")
         return
     except Exception as e:
         logger.error(f"Beklenmedik LLM Hatası: {e}")
         await update.message.reply_text("Üzgünüm, bir hata oluştu.")
         return
 
-    # 3. LLM Cevabını İşleme
+    # 3. LLM Cevabını İşleme ve Niyete Göre Yönlendirme
     
-    # import re
-
     # Kod bloğu şeklindeki JSON'u yakala (örnek: ```json { ... } ```)
     json_match = re.search(r'\{.*\}', llm_response_text, re.DOTALL)
-    if json_match:
-        json_text = json_match.group(0)
-    else:
-        json_text = llm_response_text
+    json_text = json_match.group(0) if json_match else llm_response_text
 
+    llm_feedback = None
     if json_text.startswith('{') and json_text.endswith('}'):
-        await update.message.reply_html("Rezervasyon detaylarınızı kontrol ediyorum, lütfen bekleyin... 🍽️")
         try:
             reservation_details = json.loads(json_text)
-            logger.info(f"LLM JSON Çıktısı Aldı: {reservation_details}")
+            intent = reservation_details.get("intent")
             
-            llm_feedback = await process_reservation_check(reservation_details, update)
+            await update.message.reply_html(f"Detaylarınızı kontrol ediyorum ({intent} niyetinde), lütfen bekleyin... ⏳")
+            logger.info(f"LLM JSON Çıktısı Aldı - Intent: {intent}")
+
+            if intent == "check_availability":
+                llm_feedback = await handle_check_availability(reservation_details, update)
             
-            if llm_feedback:
-                 # Hata/Başarısızlık geri bildirimi geldiyse, LLM'e doğal dilde yanıt üretmesini iste.
-                
-                # Önceki JSON cevabını kaydet (role 'model')
-                user_conversations[user_id].append(genai_types.Content(role="model", parts=[genai_types.Part(text=json_text)]))
-                
-                # Sistemden gelen geri bildirimi 'user' olarak sun
-                system_feedback_message = f"Sistemden gelen bilgi: {llm_feedback}. Bu duruma uygun şekilde müşteriye bilgi ver ve yeni seçenek iste."
-                user_conversations[user_id].append(genai_types.Content(role="user", parts=[genai_types.Part(text=system_feedback_message)]))
-                
-                # LLM'i tekrar çağır
-                await context.bot.send_chat_action(chat_id=user_id, action=ChatAction.TYPING)
-                final_response_obj = gemini_client.models.generate_content(
-                    model=GEMINI_MODEL,
-                    contents=user_conversations[user_id],
-                    config=genai_types.GenerateContentConfig(temperature=0.0)
-                )
-                final_response_text = final_response_obj.text.strip()
-                await update.message.reply_html(final_response_text)
-                user_conversations[user_id].append(genai_types.Content(role="model", parts=[genai_types.Part(text=final_response_text)]))
+            elif intent == "retrieve_reservation":
+                llm_feedback = await handle_retrieve_reservation(reservation_details, update)
+            
+            else:
+                llm_feedback = "Tanınmayan bir rezervasyon niyeti ('intent') algılandı. Lütfen sadece rezervasyon oluşturma veya sorgulama amaçlı konuşun."
 
         except json.JSONDecodeError:
             # Geçersiz JSON ise, LLM'in cevabını normal metin olarak gönder
             await update.message.reply_html(llm_response_text)
             user_conversations[user_id].append(genai_types.Content(role="model", parts=[genai_types.Part(text=llm_response_text)]))
-        
+            return
+    
     else:
-        # LLM eksik bilgi istedi veya sohbet etti
+        # LLM eksik bilgi istedi veya sohbet etti (JSON yok)
         await update.message.reply_html(llm_response_text)
         user_conversations[user_id].append(genai_types.Content(role="model", parts=[genai_types.Part(text=llm_response_text)]))
+        return
+
+    # 4. İşlem Sonrası Geri Bildirimi Yönetme (LLM_feedback varsa)
+    if llm_feedback:
+        # Hata/Başarısızlık geri bildirimi geldiyse (llm_feedback not None), LLM'e doğal dilde yanıt üretmesini iste.
+        
+        # Önceki JSON cevabını kaydet (role 'model')
+        user_conversations[user_id].append(genai_types.Content(role="model", parts=[genai_types.Part(text=json_text)]))
+        
+        # Sistemden gelen geri bildirimi 'user' olarak sun
+        system_feedback_message = f"Sistemden gelen bilgi: {llm_feedback}. Bu duruma uygun şekilde müşteriye bilgi ver ve yeni seçenek iste."
+        user_conversations[user_id].append(genai_types.Content(role="user", parts=[genai_types.Part(text=system_feedback_message)]))
+        
+        # LLM'i tekrar çağır
+        await context.bot.send_chat_action(chat_id=user_id, action=ChatAction.TYPING)
+        final_response_obj = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=user_conversations[user_id],
+            config=genai_types.GenerateContentConfig(temperature=0.0)
+        )
+        final_response_text = final_response_obj.text.strip()
+        await update.message.reply_html(final_response_text)
+        user_conversations[user_id].append(genai_types.Content(role="model", parts=[genai_types.Part(text=final_response_text)]))
 
 
 def main():
