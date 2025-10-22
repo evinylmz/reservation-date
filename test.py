@@ -15,8 +15,8 @@ from google.genai.errors import APIError as GeminiAPIError
 # --- GEREKLİ AYARLAR VE LOGLAMA ---
 
 # Token ve Anahtarlarınız (Değerleriniz Koda Yerleştirilmiştir)
-TELEGRAM_BOT_TOKEN = "8489348151:AAETbCNqd1Q8jIuVYKpAxlNmSJkkXlC46m4"
-LLM_API_KEY = "AIzaSyCoGmYhwdCLtLD3Nuis34LfkYQ7_ljplHk" 
+TELEGRAM_BOT_TOKEN = "your token"
+LLM_API_KEY = "your key" 
 RESTORAN_ADI = "Hafta3 Restoranı"
 
 # Loglama ayarı
